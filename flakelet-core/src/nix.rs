@@ -53,6 +53,11 @@ impl Nix {
         if let Some((uid, gid)) = user {
             cmd.uid(uid).gid(gid);
         }
+        // Root's `store = auto` selection can bypass nix-daemon because root
+        // can write /nix/store directly. Keep flakelet's own store writes and
+        // builds on the configured daemon without affecting child Nix
+        // processes spawned during recursive/dynamic-derivation builds.
+        cmd.env("NIX_REMOTE", "daemon");
         cmd.args(args);
         // When dropping privileges, HOME must be readable by the eval user
         // (~/.nix-defexpr etc.); the cache dir is owned by it. Otherwise keep
