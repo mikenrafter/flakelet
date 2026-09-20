@@ -1,7 +1,7 @@
 use crate::config::{Config, Credentials, EvalSettings};
 use crate::error::{Error, Result};
 use rustix::fs::{Gid, Uid};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::process::CommandExt;
@@ -53,6 +53,18 @@ impl Nix {
         if let Some((uid, gid)) = user {
             cmd.uid(uid).gid(gid);
         }
+        // `run_root` runs as the calling user, which for a `sudo flakelet ...`
+        // invocation is root — and Nix's `store = auto` resolution defaults
+        // root to a local direct store (root can write /nix/store without
+        // the daemon), silently bypassing nix-daemon.service. That matters
+        // for recursive-nix/dynamic-derivation builds, which need to reach
+        // the *actual running daemon* at a fixed socket path, not whatever
+        // store this particular invocation happened to pick. Force it here,
+        // scoped to flakelet's own process only — NOT via a global
+        // `nix.conf` store setting, which would also apply to every helper
+        // Nix spawns internally for recursive-nix/builder-rpc-v0 handling
+        // during the build itself and can cause those to cascade.
+        cmd.env("NIX_REMOTE", "daemon");
         cmd.args(args);
         // When dropping privileges, HOME must be readable by the eval user
         // (~/.nix-defexpr etc.); the cache dir is owned by it. Otherwise keep
@@ -110,7 +122,50 @@ impl Nix {
 
     /// Locked flake URL including narHash, suitable for a pure builtins.getFlake.
     /// `refresh` bypasses the tarball/eval caches to see new upstream revisions.
+    ///
+    /// For `path:` refs, `refresh` is additionally gated on a cheap git-based
+    /// fingerprint of the referenced directory (see `path_ref_fingerprint`):
+    /// `nix flake metadata --refresh` is only actually invoked when that
+    /// fingerprint changed since the last call, and the previous result is
+    /// reused otherwise. Remote refs are unaffected and always behave as
+    /// before. This exists for deployments with many services pointing
+    /// `path:` refs at subdirectories of one shared git working tree — an
+    /// unconditional `--refresh` on every scheduled update means every
+    /// service's timer independently re-hashes the same tree on every tick,
+    /// and when several land close together (timer jitter narrows the odds
+    /// but doesn't rule this out at high service counts) they contend on the
+    /// same repo's git locks and can back up the daemon with stalled,
+    /// retrying connections. A fingerprint that hasn't changed means the
+    /// previous `nix flake metadata` answer is still correct, so there is
+    /// nothing to gain from re-running it.
     pub fn locked_url(&self, flake: &str, refresh: bool) -> Result<LockedFlake> {
+        if refresh {
+            if let Some(fingerprint) = path_ref_fingerprint(flake) {
+                let cache_file = self.refresh_cache_file(flake);
+                if let Some(cached) = read_refresh_cache(&cache_file) {
+                    if cached.fingerprint == fingerprint {
+                        return Ok(LockedFlake {
+                            url: cached.url,
+                            rev: cached.rev,
+                        });
+                    }
+                }
+                let locked = self.locked_url_uncached(flake, true)?;
+                write_refresh_cache(
+                    &cache_file,
+                    &RefreshCache {
+                        fingerprint,
+                        url: locked.url.clone(),
+                        rev: locked.rev.clone(),
+                    },
+                );
+                return Ok(locked);
+            }
+        }
+        self.locked_url_uncached(flake, refresh)
+    }
+
+    fn locked_url_uncached(&self, flake: &str, refresh: bool) -> Result<LockedFlake> {
         let mut a = args(&["flake", "metadata", "--json"]);
         if refresh {
             a.push("--refresh".into());
@@ -123,6 +178,17 @@ impl Nix {
             url: with_nar_hash(&meta.url, &meta.locked.nar_hash),
             rev: meta.locked.rev.unwrap_or(meta.locked.nar_hash),
         })
+    }
+
+    /// Cache file for a given flake ref's refresh fingerprint, under the
+    /// shared eval cache dir so it's writable by the same eval user as
+    /// everything else `Nix` touches.
+    fn refresh_cache_file(&self, flake: &str) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(flake, &mut hasher);
+        self.cache_dir
+            .join("path-refresh-cache")
+            .join(format!("{:016x}.json", std::hash::Hasher::finish(&hasher)))
     }
 
     /// Add a rendered driver expression to the store.
@@ -295,6 +361,61 @@ fn args(a: &[&str]) -> Vec<String> {
 pub struct LockedFlake {
     pub url: String,
     pub rev: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RefreshCache {
+    fingerprint: String,
+    url: String,
+    rev: String,
+}
+
+fn read_refresh_cache(path: &Path) -> Option<RefreshCache> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn write_refresh_cache(path: &Path, cache: &RefreshCache) {
+    // Best-effort: a failed cache write just means the next call refreshes
+    // for real again, never a correctness problem.
+    let Some(parent) = path.parent() else { return };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(data) = serde_json::to_string(cache) {
+        let _ = fs::write(path, data);
+    }
+}
+
+/// Cheap fingerprint for a `path:` flake ref pointing into a git working
+/// tree: the repo's current HEAD plus the working-tree status of the
+/// referenced subdirectory. Unlike `nix flake metadata --refresh`, this
+/// never touches the nix daemon and never contends with a sibling `path:`
+/// ref's own git operations beyond git's own (fast, read-mostly) index
+/// locking. Returns `None` for anything that isn't a plain `path:` ref, or
+/// isn't inside a git repo — callers should always refresh for real in
+/// that case, matching the pre-existing behavior.
+fn path_ref_fingerprint(flake: &str) -> Option<String> {
+    let rest = flake.strip_prefix("path:")?;
+    // path: refs can carry query params (?dir=, ?rev=, ...); strip them for
+    // the filesystem path but keep the ref itself untouched elsewhere.
+    let dir = rest.split(['?', '#']).next().unwrap_or(rest);
+    if dir.is_empty() {
+        return None;
+    }
+
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let head = git(&["rev-parse", "HEAD"])?;
+    // Scoped to `dir` itself (git -C sets the default pathspec root), so
+    // unrelated changes elsewhere in the repo don't invalidate this.
+    let status = git(&["status", "--porcelain", "."]).unwrap_or_default();
+    Some(format!("{head}:{status}"))
 }
 
 #[derive(Debug, Deserialize)]
