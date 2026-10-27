@@ -144,5 +144,11 @@ in
     machine.succeed("rm /run/systemd/system/web.service")
     machine.succeed("flakelet boot")
     machine.succeed("test -L /run/systemd/system/web.service")
+
+    # Boot also starts an enabled service that is down (the boot transaction
+    # was built before /run held any unit links).
+    machine.succeed("systemctl stop web.service")
+    machine.succeed("flakelet boot")
+    machine.wait_for_unit("web.service")
   '';
 }

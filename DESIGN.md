@@ -387,6 +387,13 @@ units that want to order themselves after "the flakelet services are up" can
 depend on that target. The boot unit needs no evaluation and no network,
 which matters for machines that boot while offline.
 
+The boot unit also starts every re-linked unit that has an `[Install]`
+section. It cannot leave that to `multi-user.target`: systemd builds the boot
+transaction while `/run` is still empty, so `.wants` links made later are
+never acted on (and systemd ignores a `.wants` link that points at a
+differently named store file). The start is `--no-block`, so a unit ordered
+after the network does not hold up the boot unit.
+
 Offline behaviour in general follows one rule: an unattended update must not
 take a working service down just because the network is flaky. When an
 evaluation fails with a network error, the update oneshot keeps the current

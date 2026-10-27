@@ -60,7 +60,14 @@ pub fn remove(units: &Units) -> Result<()> {
     switch(units, &Units::new())
 }
 
-/// Re-link units at boot without starting anything; systemd targets pull them in.
+/// Re-link units at boot and start the ones that have an `[Install]` section.
+///
+/// Enabling alone does not bring them up: `/run` is empty when systemd builds
+/// the boot transaction, so `multi-user.target` never learns about the
+/// `.wants` links made afterwards, and systemd ignores a `.wants` link whose
+/// target is a differently named store file ("has different name"). Started
+/// with `--no-block` so a unit ordered after the network cannot hold up the
+/// boot unit that calls this.
 pub fn relink(units: &Units) -> Result<()> {
     for (unit, path) in units {
         link(unit, path)?;
@@ -69,6 +76,7 @@ pub fn relink(units: &Units) -> Result<()> {
     for (unit, path) in units {
         if has_install(unit, path)? {
             systemctl(&["enable", "--runtime", unit])?;
+            systemctl(&["start", "--no-block", unit])?;
         }
     }
     Ok(())
